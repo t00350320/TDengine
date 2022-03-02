@@ -137,7 +137,7 @@ static SSqlObj *taosConnectImpl(const char *ip, const char *user, const char *pa
     char tmp[TSDB_DB_NAME_LEN] = {0};
     tstrncpy(tmp, db, sizeof(tmp));
 
-    strdequote(tmp);
+    stringProcess(tmp, (int32_t)strlen(tmp));
     strtolower(pObj->db, tmp);
   }
 
@@ -201,9 +201,9 @@ TAOS *taos_connect_internal(const char *ip, const char *user, const char *pass, 
     if (pSql->res.code != TSDB_CODE_SUCCESS) {
       terrno = pSql->res.code;
       if (terrno ==TSDB_CODE_RPC_FQDN_ERROR) {
-        printf("taos connect failed, reason: %s\n\n", taos_errstr(pSql));
+        printf("connect failed, reason: %s\n\n", taos_errstr(pSql));
       } else {
-        printf("taos connect failed, reason: %s.\n\n", tstrerror(terrno));
+        printf("connect failed, reason: %s.\n\n", tstrerror(terrno));
       }
       taos_free_result(pSql);
       taos_close(pObj);
@@ -213,8 +213,8 @@ TAOS *taos_connect_internal(const char *ip, const char *user, const char *pass, 
     tscDebug("%p DB connection is opening, rpcObj: %p, dnodeConn:%p", pObj, pObj->pRpcObj, pObj->pRpcObj->pDnodeConn);
     taos_free_result(pSql);
   
-    // version compare only requires the first 3 segments of the version string
-    int code = taosCheckVersion(version, taos_get_server_info(pObj), 3);
+    // version compare only requires the first 1 segments of the version string
+    int code = taosCheckVersion(version, taos_get_server_info(pObj), 1);
     if (code != 0) {
       terrno = code;
       taos_close(pObj);
@@ -545,6 +545,28 @@ int taos_fetch_block(TAOS_RES *res, TAOS_ROW *rows) {
 
   tscClearSqlOwner(pSql);
   return pRes->numOfRows;
+}
+
+TAOS_ROW *taos_result_block(TAOS_RES *res) {
+  SSqlObj *pSql = (SSqlObj *)res;
+  if (pSql == NULL || pSql->signature != pSql) {
+    terrno = TSDB_CODE_TSC_DISCONNECTED;
+    return NULL;
+  }
+
+  SSqlCmd *pCmd = &pSql->cmd;
+  SSqlRes *pRes = &pSql->res;
+
+  if (pCmd == NULL ||
+      pRes == NULL ||
+      pRes->qId == 0 ||
+      pRes->code == TSDB_CODE_TSC_QUERY_CANCELLED ||
+      pCmd->command == TSDB_SQL_RETRIEVE_EMPTY_RESULT ||
+      pCmd->command == TSDB_SQL_INSERT) {
+    return NULL;
+  }
+
+  return &pRes->urow;
 }
 
 int taos_select_db(TAOS *taos, const char *db) {
@@ -1006,7 +1028,7 @@ int taos_load_table_info(TAOS *taos, const char *tableNameList) {
 
   SArray* vgroupList = taosArrayInit(4, POINTER_BYTES);
   if (vgroupList == NULL) {
-    taosArrayDestroy(plist);
+    taosArrayDestroy(&plist);
     tfree(str);
     return TSDB_CODE_TSC_OUT_OF_MEMORY;
   }
@@ -1023,8 +1045,8 @@ int taos_load_table_info(TAOS *taos, const char *tableNameList) {
 
   if (code != TSDB_CODE_SUCCESS) {
     tscFreeSqlObj(pSql);
-    taosArrayDestroyEx(plist, freeElem);
-    taosArrayDestroyEx(vgroupList, freeElem);
+    taosArrayDestroyEx(&plist, freeElem);
+    taosArrayDestroyEx(&vgroupList, freeElem);
     return code;
   }
 
@@ -1037,8 +1059,8 @@ int taos_load_table_info(TAOS *taos, const char *tableNameList) {
     code = TSDB_CODE_SUCCESS;
   }
 
-  taosArrayDestroyEx(plist, freeElem);
-  taosArrayDestroyEx(vgroupList, freeElem);
+  taosArrayDestroyEx(&plist, freeElem);
+  taosArrayDestroyEx(&vgroupList, freeElem);
 
   if (code != TSDB_CODE_SUCCESS) {
     tscFreeRegisteredSqlObj(pSql);

@@ -363,6 +363,41 @@ void tscSetFqdnErrorMsg(SSqlObj* pSql, SRpcEpSet* pEpSet) {
   }
 }
 
+bool shouldRewTableMeta(SSqlObj* pSql, SRpcMsg* rpcMsg) {
+  SSqlCmd *pCmd = &pSql->cmd;
+  SQueryInfo* pQueryInfo = tscGetQueryInfo(pCmd);
+  int32_t cmd = pCmd->command;
+
+  if ((cmd != TSDB_SQL_SELECT && cmd != TSDB_SQL_UPDATE_TAGS_VAL)) {
+    return false;
+  }
+
+  if (rpcMsg->code != TSDB_CODE_TDB_INVALID_TABLE_ID &&
+      rpcMsg->code != TSDB_CODE_VND_INVALID_VGROUP_ID &&
+      rpcMsg->code != TSDB_CODE_QRY_INVALID_SCHEMA_VERSION &&
+      rpcMsg->code != TSDB_CODE_RPC_NETWORK_UNAVAIL &&
+      rpcMsg->code != TSDB_CODE_APP_NOT_READY ) {
+    return false;
+  }
+
+  if (rpcMsg->code == TSDB_CODE_QRY_INVALID_SCHEMA_VERSION) {
+    return true;
+  }
+
+  // 1. super table subquery
+  // 2. nest queries are all not updated the tablemeta and retry parse the sql after cleanup local tablemeta/vgroup id buffer
+  if ((TSDB_QUERY_HAS_TYPE(pQueryInfo->type, (TSDB_QUERY_TYPE_STABLE_SUBQUERY | TSDB_QUERY_TYPE_SUBQUERY | TSDB_QUERY_TYPE_TAG_FILTER_QUERY)) &&
+       !TSDB_QUERY_HAS_TYPE(pQueryInfo->type, TSDB_QUERY_TYPE_PROJECTION_QUERY)) ||
+      (TSDB_QUERY_HAS_TYPE(pQueryInfo->type, TSDB_QUERY_TYPE_NEST_SUBQUERY)) ||
+      (TSDB_QUERY_HAS_TYPE(pQueryInfo->type, TSDB_QUERY_TYPE_STABLE_SUBQUERY) &&  pQueryInfo->distinct)
+      || (TSDB_QUERY_HAS_TYPE(pQueryInfo->type, TSDB_QUERY_TYPE_JOIN_QUERY))) {
+    return false;
+  }
+
+  // single table query error need to renew table meta.
+  return true;
+}
+
 void tscProcessMsgFromServer(SRpcMsg *rpcMsg, SRpcEpSet *pEpSet) {
   TSDB_CACHE_PTR_TYPE handle = (TSDB_CACHE_PTR_TYPE) rpcMsg->ahandle;
   SSqlObj* pSql = (SSqlObj*)taosAcquireRef(tscObjRef, handle);
@@ -415,42 +450,29 @@ void tscProcessMsgFromServer(SRpcMsg *rpcMsg, SRpcEpSet *pEpSet) {
     pSql->cmd.insertParam.schemaAttached = 1;
   }
 
-  // single table query error need to be handled here.
-  if ((cmd == TSDB_SQL_SELECT || cmd == TSDB_SQL_UPDATE_TAGS_VAL) &&
-      (((rpcMsg->code == TSDB_CODE_TDB_INVALID_TABLE_ID || rpcMsg->code == TSDB_CODE_VND_INVALID_VGROUP_ID)) ||
-       rpcMsg->code == TSDB_CODE_RPC_NETWORK_UNAVAIL || rpcMsg->code == TSDB_CODE_APP_NOT_READY)) {
+  bool renewTableMeta = shouldRewTableMeta(pSql, rpcMsg);
+ if (renewTableMeta) {
+    pSql->retry += 1;
+    tscWarn("0x%" PRIx64 " it shall renew table meta, code:%s, retry:%d", pSql->self, tstrerror(rpcMsg->code), pSql->retry);
 
-    // 1. super table subquery
-    // 2. nest queries are all not updated the tablemeta and retry parse the sql after cleanup local tablemeta/vgroup id buffer
-    if ((TSDB_QUERY_HAS_TYPE(pQueryInfo->type, (TSDB_QUERY_TYPE_STABLE_SUBQUERY | TSDB_QUERY_TYPE_SUBQUERY |
-                                               TSDB_QUERY_TYPE_TAG_FILTER_QUERY)) &&
-                                               !TSDB_QUERY_HAS_TYPE(pQueryInfo->type, TSDB_QUERY_TYPE_PROJECTION_QUERY)) ||
-                                               (TSDB_QUERY_HAS_TYPE(pQueryInfo->type, TSDB_QUERY_TYPE_NEST_SUBQUERY)) || (TSDB_QUERY_HAS_TYPE(pQueryInfo->type, TSDB_QUERY_TYPE_STABLE_SUBQUERY) &&  pQueryInfo->distinct)
-                                              || (TSDB_QUERY_HAS_TYPE(pQueryInfo->type, TSDB_QUERY_TYPE_JOIN_QUERY))) {
-      // do nothing in case of super table subquery
-    }  else {
-      pSql->retry += 1;
-      tscWarn("0x%" PRIx64 " it shall renew table meta, code:%s, retry:%d", pSql->self, tstrerror(rpcMsg->code), pSql->retry);
+    pSql->res.code = rpcMsg->code;  // keep the previous error code
+    if (pSql->retry > pSql->maxRetry) {
+      tscError("0x%" PRIx64 " max retry %d reached, give up", pSql->self, pSql->maxRetry);
+    } else {
+      // wait for a little bit moment and then retry
+      // todo do not sleep in rpc callback thread, add this process into queue to process
+      if (rpcMsg->code == TSDB_CODE_APP_NOT_READY || rpcMsg->code == TSDB_CODE_VND_INVALID_VGROUP_ID) {
+        int32_t duration = getWaitingTimeInterval(pSql->retry);
+        taosMsleep(duration);
+      }
 
-      pSql->res.code = rpcMsg->code;  // keep the previous error code
-      if (pSql->retry > pSql->maxRetry) {
-        tscError("0x%" PRIx64 " max retry %d reached, give up", pSql->self, pSql->maxRetry);
-      } else {
-        // wait for a little bit moment and then retry
-        // todo do not sleep in rpc callback thread, add this process into queue to process
-        if (rpcMsg->code == TSDB_CODE_APP_NOT_READY || rpcMsg->code == TSDB_CODE_VND_INVALID_VGROUP_ID) {
-          int32_t duration = getWaitingTimeInterval(pSql->retry);
-          taosMsleep(duration);
-        }
-
-        pSql->retryReason = rpcMsg->code;
-        rpcMsg->code = tscRenewTableMeta(pSql, 0);
-        // if there is an error occurring, proceed to the following error handling procedure.
-        if (rpcMsg->code == TSDB_CODE_TSC_ACTION_IN_PROGRESS) {
-          taosReleaseRef(tscObjRef, handle);
-          rpcFreeCont(rpcMsg->pCont);
-          return;
-        }
+      pSql->retryReason = rpcMsg->code;
+      rpcMsg->code = tscRenewTableMeta(pSql);
+      // if there is an error occurring, proceed to the following error handling procedure.
+      if (rpcMsg->code == TSDB_CODE_TSC_ACTION_IN_PROGRESS) {
+        taosReleaseRef(tscObjRef, handle);
+        rpcFreeCont(rpcMsg->pCont);
+        return;
       }
     }
   }
@@ -511,6 +533,7 @@ void tscProcessMsgFromServer(SRpcMsg *rpcMsg, SRpcEpSet *pEpSet) {
   }
 
   bool shouldFree = tscShouldBeFreed(pSql);
+
   if (rpcMsg->code != TSDB_CODE_TSC_ACTION_IN_PROGRESS) {
     if (rpcMsg->code != TSDB_CODE_SUCCESS) {
       pRes->code = rpcMsg->code;
@@ -837,7 +860,7 @@ static int32_t serializeSqlExpr(SSqlExpr* pExpr, STableMetaInfo* pTableMetaInfo,
     return TSDB_CODE_TSC_INVALID_OPERATION;
   }
 
-  if (pExpr->resColId >= 0) {
+  if (pExpr->resColId > 0) {
     tscError("result column id underflowed: %d", pExpr->resColId);
     return TSDB_CODE_TSC_RES_TOO_MANY;
   }
@@ -962,7 +985,7 @@ int tscBuildQueryMsg(SSqlObj *pSql, SSqlInfo *pInfo) {
   pQueryMsg->numOfGroupCols = htons(pQueryInfo->groupbyExpr.numOfGroupCols);
   pQueryMsg->queryType      = htonl(pQueryInfo->type);
   pQueryMsg->prevResultLen  = htonl(pQueryInfo->bufLen);
-
+  
   // set column list ids
   size_t numOfCols = taosArrayGetSize(pQueryInfo->colList);
   char *pMsg = (char *)(pQueryMsg->tableCols) + numOfCols * sizeof(SColumnInfo);
@@ -1148,21 +1171,21 @@ int tscBuildQueryMsg(SSqlObj *pSql, SSqlInfo *pInfo) {
   pMsg += sqlLen;
 
 
-/*
-  //MSG EXTEND DEMO
+
   pQueryMsg->extend = 1;
   
   STLV *tlv = (STLV *)pMsg;
-  tlv->type = htons(TLV_TYPE_DUMMY);
-  tlv->len  = htonl(sizeof(int16_t));
-  *(int16_t *)tlv->value = htons(12345);
+  tlv->type = htons(TLV_TYPE_META_VERSION);
+  tlv->len  = htonl(sizeof(int16_t) * 2);
+  *(int16_t*)tlv->value = htons(pTableMeta->sversion);
+  *(int16_t*)(tlv->value+sizeof(int16_t)) = htons(pTableMeta->tversion);
   pMsg += sizeof(*tlv) + ntohl(tlv->len);
 
   tlv = (STLV *)pMsg;
+  tlv->type = htons(TLV_TYPE_END_MARK);
   tlv->len = 0;
   pMsg += sizeof(*tlv);
 
-*/
 
   int32_t msgLen = (int32_t)(pMsg - pCmd->payload);
 
@@ -1175,8 +1198,8 @@ int tscBuildQueryMsg(SSqlObj *pSql, SSqlInfo *pInfo) {
 
   _end:
   freeQueryAttr(&query);
-  taosArrayDestroy(tableScanOperator);
-  taosArrayDestroy(queryOperator);
+  taosArrayDestroy(&tableScanOperator);
+  taosArrayDestroy(&queryOperator);
   return code;
 }
 
@@ -1859,6 +1882,13 @@ int tscProcessRetrieveGlobalMergeRsp(SSqlObj *pSql) {
 
     tscDebug("0x%"PRIx64" create QInfo 0x%"PRIx64" to execute query processing", pSql->self, pSql->self);
     pQueryInfo->pQInfo = createQInfoFromQueryNode(pQueryInfo, &tableGroupInfo, NULL, NULL, pRes->pMerger, MERGE_STAGE, pSql->self);
+    if (pQueryInfo->pQInfo == NULL) {
+      taosHashCleanup(tableGroupInfo.map);
+      taosArrayDestroy(&group);
+      tscAsyncResultOnError(pSql);
+      pRes->code = TSDB_CODE_QRY_OUT_OF_MEMORY;
+      return pRes->code;
+    }
   }
 
   uint64_t localQueryId = pSql->self;
@@ -1866,6 +1896,7 @@ int tscProcessRetrieveGlobalMergeRsp(SSqlObj *pSql) {
   bool convertJson = true;
   if (pQueryInfo->isStddev == true) convertJson = false;
   convertQueryResult(pRes, pQueryInfo, pSql->self, true, convertJson);
+  pRes->code = pQueryInfo->pQInfo->code;
 
   code = pRes->code;
   if (pRes->code == TSDB_CODE_SUCCESS) {
@@ -2259,7 +2290,7 @@ int tscProcessRetrieveFuncRsp(SSqlObj* pSql) {
   SQueryInfo* parQueryInfo = tscGetQueryInfo(&parent->cmd);
 
   assert(parent->signature == parent && (int64_t)pSql->param == parent->self);
-  taosArrayDestroy(parQueryInfo->pUdfInfo);
+  taosArrayDestroy(&parQueryInfo->pUdfInfo);
 
   parQueryInfo->pUdfInfo = pQueryInfo->pUdfInfo;   // assigned to parent sql obj.
   pQueryInfo->pUdfInfo = NULL;
@@ -2371,7 +2402,7 @@ int tscProcessMultiTableMetaRsp(SSqlObj *pSql) {
 
     int32_t size = 0;
     if (p->vgroupIdList!= NULL) {
-      taosArrayDestroy(p->vgroupIdList);
+      taosArrayDestroy(&p->vgroupIdList);
     }
 
     p->vgroupIdList = createVgroupIdListFromMsg(pParentSql, pMsg, pSet, fname, &size, pSql->self);
@@ -2690,7 +2721,9 @@ int tscProcessQueryRsp(SSqlObj *pSql) {
   pRes->data = NULL;
 
   tscResetForNextRetrieve(pRes);
+
   tscDebug("0x%"PRIx64" query rsp received, qId:0x%"PRIx64, pSql->self, pRes->qId);
+
   return 0;
 }
 
@@ -2702,7 +2735,7 @@ static void decompressQueryColData(SSqlObj *pSql, SSqlRes *pRes, SQueryInfo* pQu
   compSizes = (int32_t *)(pData + compLen);
 
   TAOS_FIELD *pField = tscFieldInfoGetField(&pQueryInfo->fieldsInfo, numOfCols - 1);
-  int16_t     offset = tscFieldInfoGetOffset(pQueryInfo, numOfCols - 1);
+  int32_t     offset = tscFieldInfoGetOffset(pQueryInfo, numOfCols - 1);
   char       *outputBuf = tcalloc(pRes->numOfRows, (pField->bytes + offset));
 
   char *p = outputBuf;
@@ -2803,10 +2836,11 @@ int tscProcessRetrieveRspFromNode(SSqlObj *pSql) {
 
   pRes->row = 0;
   tscDebug("0x%"PRIx64" numOfRows:%d, offset:%" PRId64 ", complete:%d, qId:0x%"PRIx64, pSql->self, pRes->numOfRows, pRes->offset,
-      pRes->completed, pRes->qId);
+           pRes->completed, pRes->qId);
 
   return 0;
 }
+
 
 void tscTableMetaCallBack(void *param, TAOS_RES *res, int code);
 
@@ -3074,28 +3108,46 @@ static void freeElem(void* p) {
 /**
  * retrieve table meta from mnode, and then update the local table meta hashmap.
  * @param pSql          sql object
- * @param tableIndex    table index
  * @return              status code
  */
-int tscRenewTableMeta(SSqlObj *pSql, int32_t tableIndex) {
+int tscRenewTableMeta(SSqlObj *pSql) {
+  int32_t code = TSDB_CODE_SUCCESS;
   SSqlCmd* pCmd = &pSql->cmd;
 
   SQueryInfo     *pQueryInfo = tscGetQueryInfo(pCmd);
-  STableMetaInfo *pTableMetaInfo = tscGetMetaInfo(pQueryInfo, tableIndex);
 
-  char name[TSDB_TABLE_FNAME_LEN] = {0};
-  int32_t code = tNameExtractFullName(&pTableMetaInfo->name, name);
-  if (code != TSDB_CODE_SUCCESS) {
-    tscError("0x%"PRIx64" failed to generate the table full name", pSql->self);
-    return TSDB_CODE_TSC_INVALID_OPERATION;
+  SArray* pNameList = taosArrayInit(1, POINTER_BYTES);
+  SArray* vgroupList = taosArrayInit(1, POINTER_BYTES);
+
+  SHashObj *nameTable = taosHashInit(4, taosGetDefaultHashFunction(TSDB_DATA_TYPE_BINARY), false, HASH_NO_LOCK);
+
+  while (pQueryInfo) {
+    STableMetaInfo *pTableMetaInfo = tscGetMetaInfo(pQueryInfo, 0);
+
+    char name[TSDB_TABLE_FNAME_LEN] = {0};
+    code = tNameExtractFullName(&pTableMetaInfo->name, name);
+    if (code != TSDB_CODE_SUCCESS) {
+      tscError("0x%"PRIx64" failed to generate the table full name", pSql->self);
+      return TSDB_CODE_TSC_INVALID_OPERATION;
+    }
+
+    //do not add duplicate names
+    if (!taosHashGet(nameTable, name, strlen(name))) {
+      STableMeta* pTableMeta = pTableMetaInfo->pTableMeta;
+      if (pTableMeta) {
+        tscDebug("0x%"PRIx64" update table meta:%s, old meta numOfTags:%d, numOfCols:%d, uid:%" PRIu64, pSql->self, name,
+                 tscGetNumOfTags(pTableMeta), tscGetNumOfColumns(pTableMeta), pTableMeta->id.uid);
+      }
+
+      char* n = strdup(name);
+      taosArrayPush(pNameList, &n);
+      uint8_t dummy_val = 0;
+      taosHashPut(nameTable, name, strlen(name), &dummy_val, sizeof(uint8_t));
+    }
+    pQueryInfo = pQueryInfo->sibling;
   }
 
-  STableMeta* pTableMeta = pTableMetaInfo->pTableMeta;
-  if (pTableMeta) {
-    tscDebug("0x%"PRIx64" update table meta:%s, old meta numOfTags:%d, numOfCols:%d, uid:%" PRIu64, pSql->self, name,
-             tscGetNumOfTags(pTableMeta), tscGetNumOfColumns(pTableMeta), pTableMeta->id.uid);
-  }
-
+  taosHashCleanup(nameTable);
 
   // remove stored tableMeta info in hash table
   tscResetSqlCmd(pCmd, true, pSql->self);
@@ -3103,21 +3155,17 @@ int tscRenewTableMeta(SSqlObj *pSql, int32_t tableIndex) {
   SSqlCmd* pCmd2 = &pSql->rootObj->cmd;
   pCmd2->pTableMetaMap = tscCleanupTableMetaMap(pCmd2->pTableMetaMap);
   pCmd2->pTableMetaMap = taosHashInit(4, taosGetDefaultHashFunction(TSDB_DATA_TYPE_BINARY), false, HASH_NO_LOCK);
-  
+
   pSql->rootObj->retryReason = pSql->retryReason;
 
-  SSqlObj *tmpSql = pSql->rootObj;
-  tscFreeSubobj(pSql->rootObj);
-  tfree(tmpSql->pSubs);
+  SSqlObj *rootSql = pSql->rootObj;
+  tscFreeSubobj(rootSql);
+  tfree(rootSql->pSubs);
+  tscResetSqlCmd(&rootSql->cmd, true, rootSql->self);
 
-  SArray* pNameList = taosArrayInit(1, POINTER_BYTES);
-  SArray* vgroupList = taosArrayInit(1, POINTER_BYTES);
-
-  char* n = strdup(name);
-  taosArrayPush(pNameList, &n);
-  code = getMultiTableMetaFromMnode(tmpSql, pNameList, vgroupList, NULL, tscTableMetaCallBack, true);
-  taosArrayDestroyEx(pNameList, freeElem);
-  taosArrayDestroyEx(vgroupList, freeElem);
+  code = getMultiTableMetaFromMnode(rootSql, pNameList, vgroupList, NULL, tscTableMetaCallBack, true);
+  taosArrayDestroyEx(&pNameList, freeElem);
+  taosArrayDestroyEx(&vgroupList, freeElem);
 
   return code;
 }
